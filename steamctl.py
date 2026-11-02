@@ -14,8 +14,17 @@ client's own UI uses. This is how Decky Loader talks to Steam too.
                                     -> install without Steam's window
   steamctl.py uninstall <appid>     -> uninstall a game (no confirmation dialog)
   steamctl.py friends               -> friend list with live presence and unread counts
-  steamctl.py chat <accountid> [read]
-                                    -> recent messages with a friend ("read" marks them read)
+  steamctl.py groups                -> your group chats and their rooms
+  steamctl.py members <group id>    -> everyone in a group chat, online first
+  steamctl.py remote                -> other computers online and the games they can stream
+  steamctl.py stream <appid> <client id>
+                                    -> stream a game from one of them
+  steamctl.py desktop <client id>   -> Remote Play another computer's desktop
+  steamctl.py chat <chat> [read]    -> recent messages in a chat ("read" marks them read);
+                                       <chat> is a friend's account id or groupid:roomid
+  steamctl.py react <accountid> <ts> <ordinal> <type> <reaction> add|remove
+                                    -> react to a message (or take it back)
+  steamctl.py emoticons             -> the emoticons you can react with, recent first
   steamctl.py send <accountid>      -> send the chat message read from stdin
                                        (never argv, where other users can see it)
   steamctl.py wizard-state          -> install wizard state (8 = showing a EULA)
@@ -26,11 +35,14 @@ Every command prints {"ok": true, "value": ...} or {"ok": false, "error": ...}.
 import base64
 import json
 import os
+import re
 import socket
 import struct
 import sys
 import urllib.error
 import urllib.request
+
+import cache
 
 PORT = 8080
 # Byte ceilings for what Steam's debug port hands back, and for what's
@@ -38,6 +50,7 @@ PORT = 8080
 MAX_TARGETS = 1024 * 1024
 MAX_MESSAGE = 16 * 1024 * 1024
 MAX_OUTPUT = 8 * 1024 * 1024
+MAX_APPINFO = 1024 * 1024
 
 
 def target_ws():
@@ -139,7 +152,7 @@ def evaluate(js, timeout=15):
 FOLDERS_JS = """
 SteamClient.InstallFolder.GetInstallFolders().then(f => f.filter(x => x.bIsMounted).map(x => ({
   index: x.nFolderIndex, path: x.strFolderPath, label: x.strUserLabel, drive: x.strDriveName,
-  free: x.nFreeSpace, capacity: x.nCapacity, isDefault: x.bIsDefaultFolder })))
+  free: x.nFreeSpace, isDefault: x.bIsDefaultFolder })))
 """
 
 OVERVIEW_JS = """
@@ -278,38 +291,180 @@ INSTALL_JS = """
 """
 
 
-FRIENDS_JS = """
-(() => {
-  const app = g_FriendsUIApp
+# A Steam player (a friend, a group member, a chat sender) as the widget shows
+# them: name, avatar, presence, and the game they're in with its icon.
+PERSONA_JS = r"""(() => {
   const states = ["offline", "online", "busy", "away", "away", "online", "online"]
-  return Array.from(app.FriendStore.all_friends || []).map(f => {
+  const avatar = hash => hash && !/^0+$/.test(hash) ? "https://avatars.fastly.steamstatic.com/" + hash + "_medium.jpg" : ""
+  const of = f => {
     const p = f.m_persona || {}
     const appid = p.m_unGamePlayedAppID || 0
-    const inGame = appid > 0 || (p.m_gameid && p.m_gameid !== "0")
-    let game = p.m_strGameExtraInfo || ""
-    if (!game && appid) {
-      try { game = (app.AppInfoStore.GetAppInfo(appid) || {}).name || "" } catch (e) {}
+    const inGame = (appid > 0 || (p.m_gameid && p.m_gameid !== "0")) && (p.m_ePersonaState || 0) !== 0
+    let game = "", gameIcon = ""
+    if (inGame) {
+      game = p.m_strGameExtraInfo || f.current_game_name || ""
+      if (!game && appid) {
+        try { game = (g_FriendsUIApp.AppInfoStore.GetAppInfo(appid) || {}).name || "" } catch (e) {}
+      }
+      // A full URL, or the hash Steam's community CDN files the icon under.
+      try {
+        const icon = String(f.current_game_icon_url || "")
+        gameIcon = /^https:\/\//.test(icon) ? icon
+          : appid && /^[0-9a-f]{40}$/i.test(icon) ? "https://cdn.fastly.steamstatic.com/steamcommunity/public/images/apps/" + appid + "/" + icon + ".jpg" : ""
+      } catch (e) {}
     }
-    const chat = app.ChatStore.GetFriendChat(f.accountid, false)
+    const persona = p.m_strPlayerName || ""
+    const name = f.display_name || f.m_strNickname || persona || String(f.accountid)
     return {
       accountid: String(f.accountid),
-      steamid: String(p.m_steamid && p.m_steamid.ConvertTo64BitString ? p.m_steamid.ConvertTo64BitString() : ""),
-      name: f.m_strNickname || p.m_strPlayerName || String(f.accountid),
-      avatar: p.m_strAvatarHash ? "https://avatars.fastly.steamstatic.com/" + p.m_strAvatarHash + "_medium.jpg" : "",
-      state: inGame && (p.m_ePersonaState || 0) !== 0 ? "in-game" : states[p.m_ePersonaState || 0] || "online",
+      steamid: String(f.steamid64 || (p.m_steamid && p.m_steamid.ConvertTo64BitString ? p.m_steamid.ConvertTo64BitString() : "")),
+      name: name,
+      personaName: persona && persona !== name ? persona : "",
+      avatar: avatar(p.m_strAvatarHash),
+      state: inGame ? "in-game" : states[p.m_ePersonaState || 0] || "online",
       game: game,
-      lastOnline: p.m_rtLastSeenOnline || 0,
-      unread: chat ? chat.unread_message_count || 0 : 0,
-      lastMessage: chat ? chat.time_last_message || 0 : 0,
+      appid: inGame ? appid : 0,
+      gameIcon: gameIcon,
     }
+  }
+  return { of: of }
+})()"""
+
+FRIENDS_JS = """
+(async () => {
+  const app = g_FriendsUIApp
+  const persona = %(persona)s
+  const invite = %(invite)s
+  // The user's own friend groups (Steam's categories) and favorites, as the
+  // client's friend list shows them.
+  const store = app.FriendStore.FriendGroupStore
+  const groups = Array.from((store && store.user_groups) || []).map(g => ({
+    id: String(g.m_iGroupID), name: g.m_strName || "", members: Array.from(g.m_rgAccountIDMembers || []),
+  }))
+  let favorites = []
+  try {
+    favorites = Array.from(app.FriendStore.FavoritesStore.favorites || [])
+      .filter(x => x && x.friend).map(x => x.friend.accountid)
+  } catch (e) {}
+  const memberOf = {}
+  for (const g of groups) for (const a of g.members) (memberOf[a] = memberOf[a] || []).push(g.id)
+  for (const a of favorites) (memberOf[a] = memberOf[a] || []).unshift("favorites")
+  // The steam:// URL that joins a friend's game, built the way Steam's own
+  // "Join Game" builds it, or "" when their game can't be joined.
+  const joinUrl = (f, steamid) => {
+    const p = f.m_persona || {}
+    const appid = p.m_unGamePlayedAppID || 0
+    if (!appid || !steamid || !p.is_in_joinable_game) return ""
+    const lobby = p.m_game_lobby_id && p.m_game_lobby_id !== "0" ? p.m_game_lobby_id : ""
+    if (lobby) return "steam://joinlobby/" + appid + "/" + lobby + "/" + steamid
+    const connect = p.connect_string
+    return "steam://rungame/" + appid + "/" + steamid + (connect ? "/" + encodeURIComponent(connect) : "")
+  }
+  const friends = Array.from(app.FriendStore.all_friends || []).map(f => {
+    let presence = ""
+    try { presence = f.current_game_rich_presence || "" } catch (e) {}
+    const chat = app.ChatStore.GetFriendChat(f.accountid, false)
+    const p = persona.of(f)
+    return Object.assign(p, {
+      presence: presence,
+      groups: memberOf[f.accountid] || [],
+      unread: chat ? chat.unread_message_count || 0 : 0,
+      join: joinUrl(f, p.steamid),
+    })
   })
+  // The game you're in, if a friend can be invited to it.
+  let self = null
+  try {
+    const mine = await invite()
+    if (mine) self = { appid: mine.appid, game: persona.of(app.FriendStore.self).game }
+  } catch (e) {}
+  return {
+    friends: friends,
+    self: self,
+    groups: (favorites.length ? [{ id: "favorites", name: "Favorites" }] : [])
+      .concat(groups.map(g => ({ id: g.id, name: g.name }))),
+  }
+})()
+"""
+
+# How a friend could be invited to the game you're in, the way Steam's friend
+# menu decides it: your lobby, else the game's private connect string, else
+# its public one. Resolves to {appid, lobby} or {appid, connect}, or null.
+INVITE_OPTIONS_JS = r"""(async () => {
+  const self = g_FriendsUIApp.FriendStore.self.m_persona || {}
+  const appid = self.m_unGamePlayedAppID || 0
+  if (!appid) return null
+  if (self.m_game_lobby_id && self.m_game_lobby_id !== "0") return { appid: appid, lobby: self.m_game_lobby_id }
+  let connect = ""
+  try { connect = await SteamClient.WebChat.GetPrivateConnectString(appid) || "" } catch (e) {}
+  connect = connect || self.connect_string || ""
+  return connect ? { appid: appid, connect: connect } : null
+})"""
+
+INVITE_JS = """
+(async () => {
+  const store = g_FriendsUIApp.FriendStore
+  const friend = Array.from(store.all_friends || []).find(f => f.accountid === %(account)s)
+  if (!friend) throw new Error("They aren't on your friends list")
+  const how = await %(invite)s()
+  if (!how) throw new Error("Your game doesn't take invites")
+  if (how.lobby) store.InviteToLobby(friend, how.appid, how.lobby)
+  else store.InviteToGame(friend, how.appid, how.connect)
+  return "invited"
+})()
+"""
+
+# Steam's notification history (the bell in its main window), as it holds it:
+# the server's notifications (sales, comments, items, invites...) with their
+# raw details and whoever they're from. Chat messages are left out, both the
+# server's and the client's own toasts.
+EVENTS_JS = r"""
+(() => {
+  const store = window.NotificationStore
+  if (!store) throw new Error("Steam's notifications aren't available")
+  const friends = g_FriendsUIApp.FriendStore
+  const BASE = 76561197960265728n
+  // An account id or a 64-bit Steam id, as a name and avatar where Steam knows them.
+  const person = id => {
+    try {
+      if (!id || !/^\d+$/.test(String(id)) || String(id) === "0") return null
+      const big = BigInt(id)
+      const accountid = Number(big >= BASE ? big - BASE : big)
+      const p = friends.GetPlayer(accountid) || {}
+      const m = p.m_persona || {}
+      const hash = m.m_strAvatarHash || ""
+      return {
+        accountid: String(accountid), steamid: String(BASE + BigInt(accountid)),
+        name: p.display_name || m.m_strPlayerName || "",
+        avatar: hash && !/^0+$/.test(hash) ? "https://avatars.fastly.steamstatic.com/" + hash + "_medium.jpg" : "",
+      }
+    } catch (e) { return null }
+  }
+  const out = []
+  for (const group of store.m_rgNotificationTray || []) {
+    for (const n of group.notifications || []) {
+      const d = n.data || {}
+      const item = d.item
+      // eSource 2 is the server's; 13 is a chat message.
+      if (n.eSource !== 2 || !item || item.hidden || item.notification_type === 13) continue
+      let body = {}
+      try { body = JSON.parse(item.body_data || "{}") || {} } catch (e) {}
+      const from = body.gifter_account || body.requestor_id || body.sender || body.responder_steamid || body.account_id
+      out.push({
+        id: String(n.notificationID), type: item.notification_type || 0, ts: item.timestamp || n.rtCreated || 0,
+        count: d.rollup_count || 1, body: body, person: person(from),
+      })
+    }
+  }
+  return out
 })()
 """
 
 # Messages are BBCode; turn the common tags into plain text for the widget.
 CHAT_JS = """
 (async () => {
-  const chat = g_FriendsUIApp.ChatStore.GetFriendChat(%(account)d, true)
+  const chat = %(target)s
+  if (!chat) throw new Error("That chat isn't available")
   if (!chat.m_bChatLogsLoaded) await chat.LoadChatLogs()
   if (%(read)s) chat.OnActivate()
   const me = g_FriendsUIApp.FriendStore.self.accountid
@@ -323,15 +478,39 @@ CHAT_JS = """
     .replace(/\\[\\/?[a-z]+[^\\]]*\\]/gi, "")
     .replace(/\\u0001/g, "[")
   const html = %(html)s
-  const msgs = chat.chat_messages.slice(-80).map(m => ({
+  const embeds = %(embeds)s
+  // Who wrote each message: group chats show the sender's name.
+  const persona = %(persona)s
+  const senders = {}
+  const sender = id => {
+    if (!senders[id]) {
+      let who = { name: String(id), avatar: "" }
+      try { who = persona.of(g_FriendsUIApp.FriendStore.GetPlayer(id)) } catch (e) {}
+      senders[id] = who
+    }
+    return senders[id]
+  }
+  const msgs = chat.chat_messages.slice(-80).map(m => {
+    const e = embeds(m.strMessage !== undefined ? m.strMessage : m.strMessageInternal)
+    const from = sender(m.unAccountID)
+    return {
     mine: m.unAccountID === me,
-    text: plain(m.strMessage !== undefined ? m.strMessage : m.strMessageInternal),
-    html: html(m.strMessage !== undefined ? m.strMessage : m.strMessageInternal),
+    accountid: String(m.unAccountID),
+    senderName: from.name,
+    senderAvatar: from.avatar,
+    text: plain(e.rest).trim(),
+    html: html(e.rest.trim()),
+    cards: e.cards,
+    // Emoticon (type 1) or sticker reactions: how many, and whether you're one.
+    reactions: (m.m_rgReactions || []).map(r => ({
+      type: r.eReactionType, name: r.strReaction, count: r.cReactors, mine: !!r.bUserReacted,
+    })),
+    ordinal: m.unOrdinal,
     ts: m.rtTimestamp,
     key: m.rtTimestamp + ":" + m.unOrdinal + ":" + (m.m_iLocalEchoID || 0),
     pending: m.unAccountID === me && !m.m_bServerAcknowledged && m.unOrdinal < 0,
     failed: !!(m.eErrorSending || m.eErrorSendingObservable),
-  }))
+  }})
   return { messages: msgs, typing: !!chat.is_friend_typing, unread: chat.unread_message_count || 0 }
 })()
 """
@@ -404,13 +583,396 @@ HTML_JS = r"""(s => {
   return out.join("")
 })"""
 
+# Store links and Workshop items arrive as [steamstore] and [publishedfile]
+# tags; lift them out of the text as cards the chat bubble draws.
+EMBEDS_JS = r"""(s => {
+  const cards = []
+  // Values come quoted (with \" escapes) or bare, as [img src=... width=949].
+  const attr = (a, key) => {
+    const r = new RegExp("\\b" + key + '=(?:"((?:[^"\\\\]|\\\\.)*)"|([^\\s"\\]]+))').exec(a || "")
+    return !r ? "" : r[1] !== undefined ? r[1].replace(/\\(.)/g, "$1") : r[2]
+  }
+  const num = v => parseInt(v, 10) || 0
+  const rest = String(s || "").replace(/\[(publishedfile|steamstore)(\s[^\]]*)?\]([\s\S]*?)\[\/\1\]/gi, (all, tag, a, body) => {
+    body = body.trim()
+    if (tag.toLowerCase() === "steamstore") {
+      const appid = num(attr(a, "app")) || num((body.match(/\/app\/(\d+)/) || [])[1])
+      if (!appid) return all
+      // The link's slug is the game's name (Lightyear_Frontier).
+      let name = (body.match(/\/app\/\d+\/([^\/?#]+)/) || [])[1] || ""
+      try { name = decodeURIComponent(name) } catch (e) {}
+      cards.push({ type: "store", appid: appid, name: name.replace(/_/g, " ").trim(),
+        url: /^https?:/.test(body) ? body : "https://store.steampowered.com/app/" + appid })
+    } else {
+      const url = attr(a, "url") || body
+      if (!/^https?:/.test(url)) return all
+      cards.push({ type: "workshop", url: url, title: attr(a, "title"), description: attr(a, "description"),
+        preview: attr(a, "preview_url"), appid: num(attr(a, "creator_appid")),
+        votesUp: num(attr(a, "votes_up")), votesDown: num(attr(a, "votes_down")),
+        comments: num(attr(a, "num_comments_public")) })
+    }
+    return ""
+  })
+  // Shared images: [img src=... thumbnail_src=... width=... height=...][url=...]...[/url][/img],
+  // or plainly [img]https://...[/img].
+  const left = rest.replace(/\[img(\s[^\]]*)?\]([\s\S]*?)\[\/img\]/gi, (all, a, body) => {
+    const src = attr(a, "src") || (body.match(/https?:\/\/[^\s\[\]"]+/) || [""])[0]
+    if (!/^https?:/.test(src)) return all
+    cards.push({ type: "image", src: src, thumb: attr(a, "thumbnail_src") || src,
+      width: num(attr(a, "width")), height: num(attr(a, "height")) })
+    return ""
+  })
+  // Steam-hosted videos and YouTube links get players of their own.
+  const media = left
+    .replace(/\[video(\s[^\]]*)?\]([\s\S]*?)\[\/video\]/gi, (all, a, body) => {
+      const src = attr(a, "src") || (body.match(/https?:\/\/[^\s\[\]"]+/) || [""])[0]
+      if (!/^https:\/\//.test(src)) return all
+      cards.push({ type: "video", src: src })
+      return ""
+    })
+    .replace(/\[youtube(=[^\s\]]+)?(\s[^\]]*)?\]([\s\S]*?)\[\/youtube\]/gi, (all, first, a, body) => {
+      const url = (first || "").slice(1) || body.trim()
+      const id = attr(a, "v") || (url.match(/(?:v=|youtu\.be\/|shorts\/)([\w-]{11})/) || [])[1] || ""
+      if (!/^[\w-]{11}$/.test(id)) return all
+      cards.push({ type: "youtube", id: id, url: "https://www.youtube.com/watch?v=" + id })
+      return ""
+    })
+  // Link previews: [og url=... img=... title=... desc=...]url[/og].
+  const previewed = media.replace(/\[og(\s[^\]]*)?\]([\s\S]*?)\[\/og\]/gi, (all, a, body) => {
+    const url = attr(a, "url") || body.trim()
+    if (!/^https?:\/\//.test(url)) return all
+    const img = attr(a, "img")
+    cards.push({ type: "link", url: url, title: attr(a, "title"), description: attr(a, "desc"),
+      preview: /^https:\/\//.test(img) ? img : "" })
+    return ""
+  })
+  // Any other Steam tag ([roomeffect], ...) becomes a card
+  // listing what it carries, with the original to copy. Plain bracketed
+  // text like [brb] has no closing tag or fields, so it stays as typed.
+  const RENDERED = /^(url|b|i|u|emoticon|sticker)$/i
+  const fields = a => {
+    const out = []
+    a = a || ""
+    const first = /^=("[^"]*"|[^\s\]]+)/.exec(a)
+    if (first) out.push(["", first[1].replace(/^"|"$/g, "")])
+    const re = /([a-z_][a-z0-9_]*)=(?:"((?:[^"\\]|\\.)*)"|([^\s"\]]+))/gi
+    let m
+    while ((m = re.exec(a.slice(first ? first[0].length : 0))) && out.length < 20)
+      out.push([m[1], m[2] !== undefined ? m[2].replace(/\\(.)/g, "$1") : m[3]])
+    return out
+  }
+  const tagCard = (all, tag, a, body) => {
+    if (RENDERED.test(tag)) return all
+    cards.push({ type: "tag", tag: tag.toLowerCase(), fields: fields(a), body: (body || "").replace(/\[\/?[a-z][^\]]*\]/gi, "").trim().slice(0, 2000),
+      raw: all.slice(0, 20000) })
+    return ""
+  }
+  const tagged = previewed
+    .replace(/\[([a-z][a-z0-9_]*)((?:=|\s)[^\]]*)?\]([\s\S]*?)\[\/\1\]/gi, tagCard)
+    .replace(/\[([a-z][a-z0-9_]*)(\s+[a-z_][a-z0-9_]*=[^\]]*)\]/gi, (all, tag, a) => tagCard(all, tag, a, ""))
+  return { rest: tagged, cards: cards }
+})"""
+
+# Remote Play: your other computers signed in to Steam and online, which
+# games each has installed (so you can stream them here), and the computer
+# Steam last picked for each game.
+REMOTE_JS = """
+(() => {
+  const devices = Array.from((window.RemotePlayStore_SteamUI && RemotePlayStore_SteamUI.devices) || [])
+    .filter(d => d && d.clientId && d.status === "Connected")
+    .map(d => ({ id: String(d.clientId), name: d.clientName || "" }))
+  const online = new Set(devices.map(d => d.id))
+  const apps = {}, selected = {}
+  for (const a of Array.from(appStore.allApps || [])) {
+    const on = (a.per_client_data || []).filter(c => c.installed && online.has(String(c.clientid)))
+    if (!on.length) continue
+    apps[a.appid] = on.map(c => String(c.clientid))
+    if (a.selected_clientid && online.has(String(a.selected_clientid))) selected[a.appid] = String(a.selected_clientid)
+  }
+  return { devices: devices, apps: apps, selected: selected }
+})()
+"""
+
+# Your group chats (named groups, Steam group chats and ad-hoc chats with
+# several friends), most recently active first, with their text rooms.
+GROUPS_JS = """
+(() => {
+  const avatar = g => {
+    const url = g.hasAvatarSHA ? String(g.avatar_url_medium || "") : ""
+    return /\\/_(medium|64)\\.jpg$/.test(url) ? "" : url
+  }
+  return Array.from(g_FriendsUIApp.ChatStore.currentChatRoomGroups || []).map(g => {
+    const rooms = Array.from(g.textRoomList || []).map(r => ({
+      id: String(r.GetRoomID()), name: r.name || "", unread: r.unread_message_count || 0,
+      mention: !!r.has_unread_mention,
+    }))
+    const unread = rooms.reduce((n, r) => n + r.unread, 0)
+    return {
+      id: String(g.GetGroupID()),
+      name: g.name || "",
+      tagline: g.tagline || "",
+      avatar: avatar(g),
+      members: g.memberCountTotal || 0,
+      defaultRoom: String(g.GetDefaultChatID()),
+      rooms: rooms,
+      unread: unread,
+      mention: rooms.some(r => r.mention),
+      activity: g.time_last_activity || 0,
+    }
+  }).sort((a, b) => b.activity - a.activity)
+})()
+"""
+
+# Everyone in a group chat. The client only loads a group's member list
+# while the group is active, so mark it active (telling Steam, as its own
+# chat window does), wait for the list, read it, and let go again.
+MEMBERS_JS = """
+(async () => {
+  const cs = g_FriendsUIApp.ChatStore
+  const g = cs.GetChatRoomGroup("%(group)s")
+  if (!g) throw new Error("That group chat isn't available")
+  const id = g.GetGroupID()
+  cs.IncRefActiveChatRoomGroup(id, true)
+  try {
+    for (let i = 0; i < 20 && !g.m_bFullStateLoaded; i++) await new Promise(r => setTimeout(r, 250))
+    const persona = %(persona)s
+    const rank = { "in-game": 0, online: 1, busy: 2, away: 2, offline: 3 }
+    return Array.from((g.memberList && g.memberList.member_list) || []).map(f => {
+      return Object.assign(persona.of(f), { isFriend: !!f.is_friend })
+    }).sort((a, b) => (rank[a.state] - rank[b.state]) || a.name.toLowerCase().localeCompare(b.name.toLowerCase()))
+  } finally {
+    cs.DecRefActiveChatRoomGroup(id, true)
+  }
+})()
+"""
+
+# Add or take back your reaction on one message, as Steam's own chat does.
+REACT_JS = """
+(async () => {
+  const chat = %(target)s
+  if (!chat) throw new Error("That chat isn't available")
+  const m = chat.chat_messages.find(m => m.rtTimestamp === %(ts)d && m.unOrdinal === %(ordinal)d)
+  if (!m) throw new Error("That message isn't loaded any more")
+  return await chat.UpdateMessageReaction(m, %(type)d, %(reaction)s, %(add)s)
+})()
+"""
+
+# The emoticons you own (what Steam's own reaction picker offers), the ones
+# you used last first. The list is only fetched once something asks for it.
+EMOTICONS_JS = """
+(async () => {
+  const es = g_FriendsUIApp.ChatStore.EmoticonStore
+  if (!es.is_initialized) {
+    es.RequestEmoticonList()
+    await Promise.race([es.BAwaitInitialized(), new Promise(ok => setTimeout(ok, 5000))])
+  }
+  const recent = (es.recent_emoticons || []).slice(0, 16).map(e => e.name)
+  const all = es.emoticon_list.map(e => e.name).sort((a, b) => a.localeCompare(b))
+  return { recent: recent, all: all }
+})()
+"""
+
 SEND_JS = """
 (() => {
-  const chat = g_FriendsUIApp.ChatStore.GetFriendChat(%(account)d, true)
+  const chat = %(target)s
+  if (!chat) throw new Error("That chat isn't available")
   chat.SendChatMessage(%(text)s)
   return "sent"
 })()
 """
+
+
+def cached_lookup(table, key, fetch):
+    """Details for a shared link, from the cache when it has them (a month;
+    a failed lookup is retried after an hour), else fetch(), then kept."""
+    info, age = cache.load_lookup(table, key)
+    if info is not None and age < (30 * 86400 if info else 3600):
+        return info
+    try:
+        info = fetch()
+    except Exception:
+        info = {}
+    cache.save_lookup(table, key, info)
+    return info
+
+
+def fetch_small_json(url):
+    with urllib.request.urlopen(url, timeout=4) as r:
+        body = r.read(MAX_APPINFO + 1)
+    return json.loads(body) if len(body) <= MAX_APPINFO else {}
+
+
+def store_app(appid):
+    """Name and header art for a shared store link. Newer games keep their
+    art under a hashed path only the store's API knows, so ask it once."""
+    if not isinstance(appid, int) or appid <= 0:
+        return {}
+
+    def fetch():
+        d = (fetch_small_json("https://store.steampowered.com/api/appdetails?appids=%d&filters=basic" % appid)
+             .get(str(appid)) or {}).get("data") or {}
+        info = {}
+        if isinstance(d.get("name"), str):
+            info["name"] = d["name"][:256]
+        if isinstance(d.get("header_image"), str) and d["header_image"].startswith("https://"):
+            info["header"] = d["header_image"][:2048]
+        return info
+    return cached_lookup("apps", appid, fetch)
+
+
+def youtube_info(video_id):
+    """Title and channel for a shared YouTube link, from YouTube's oEmbed endpoint."""
+    if not isinstance(video_id, str) or not re.fullmatch(r"[\w-]{11}", video_id):
+        return {}
+
+    def fetch():
+        d = fetch_small_json("https://www.youtube.com/oembed?format=json&url="
+                             + urllib.request.quote("https://www.youtube.com/watch?v=" + video_id, safe=""))
+        info = {}
+        if isinstance(d.get("title"), str):
+            info["title"] = d["title"][:300]
+        if isinstance(d.get("author_name"), str):
+            info["author"] = d["author_name"][:200]
+        return info
+    return cached_lookup("embeds", "youtube:" + video_id, fetch)
+
+
+# Steam's notification types (ESteamNotificationType) as the Events tab names
+# them. Chat messages (13) never reach the log.
+NOTIFICATION_KINDS = {
+    2: "gift", 3: "comment", 4: "item", 5: "friend-invite", 6: "sale", 7: "preload", 8: "wishlist",
+    9: "trade", 10: "general", 11: "help", 12: "async-game", 14: "moderator", 15: "family", 16: "family",
+    17: "family", 18: "family", 19: "family", 20: "family", 21: "family", 22: "family", 24: "clip",
+    27: "event", 28: "playtest", 29: "trade", 30: "report",
+}
+FAMILY = {
+    15: "A family member asked to use a feature", 16: "You're invited to a Steam family",
+    17: "A family member asked you to buy something", 18: "A family member asked for more playtime",
+    19: "Your purchase request was answered", 20: "Your feature request was answered",
+    21: "Your playtime request was answered", 22: "A game you asked for is in the family library",
+}
+
+
+def app_name(appid):
+    """A game's name from the store (looked up once), or ""."""
+    try:
+        appid = int(appid or 0)
+    except (TypeError, ValueError):
+        return ""
+    return store_app(appid).get("name", "") if appid > 0 else ""
+
+
+def describe_notification(n):
+    """A logged Steam notification as the Events tab shows it: kind, text,
+    detail, and the game or person it's about."""
+    t, body, count = n.get("type"), n.get("body") or {}, max(1, int(n.get("count") or 1))
+    who = n.get("person") or {}
+    name = who.get("name") or "Someone"
+    appid = 0
+    for k in ("appid", "app_id"):
+        try:
+            appid = appid or int(body.get(k) or 0)
+        except (TypeError, ValueError):
+            pass
+    game = app_name(appid) or "a game"
+    detail = ""
+    if t == 2:
+        text = "%s sent you a gift" % name if count == 1 else "%d new gifts" % count
+    elif t == 3:
+        text = "%s commented" % name if who else "New comment"
+        if body.get("title"):
+            text += " on " + str(body["title"])
+        detail = str(body.get("text") or "")
+        if count > 1:
+            text = "%d new comments" % count
+    elif t == 4:
+        text = "New item in your inventory" if count == 1 else "%d new items in your inventory" % count
+        detail = game if appid and appid != 753 else ""
+    elif t == 5:
+        text = "%s sent you a friend invite" % name
+    elif t == 6:
+        text = "A Steam sale has started"
+    elif t == 7:
+        text = "%s can be preloaded" % game
+    elif t == 8:
+        more = int(body.get("count") or 1) - 1
+        text = "%s from your wishlist is on sale" % game if more < 1 else \
+            "%s and %d more from your wishlist are on sale" % (game, more)
+    elif t == 9:
+        text = "%s sent you a trade offer" % name if count == 1 else "%d new trade offers" % count
+    elif t == 11:
+        text = "Steam Support replied to your help request"
+    elif t == 12:
+        text = "%s has an update in your game" % game
+    elif t == 14:
+        text = "A message from a Steam moderator"
+    elif t in FAMILY:
+        text = FAMILY[t]
+    elif t == 24:
+        text = "Clip of %s downloaded" % (body.get("content_app_name") or game)
+    elif t == 27:
+        text = "%s posted an event" % game
+    elif t == 28:
+        # Playtests are their own apps, often named "<game> Playtest".
+        text = "You're invited to the %s playtest" % re.sub(r"\s+playtest$", "", game, flags=re.I)
+    elif t == 29:
+        text = "A trade was reversed"
+    elif t == 30:
+        text = "Steam acted on something you reported"
+    else:
+        text = "Steam announcement" if t == 10 else "Steam notification"
+    return {"id": str(n.get("id")), "ts": int(n.get("ts") or 0), "kind": NOTIFICATION_KINDS.get(t, "steam"),
+            "text": text[:300], "detail": detail[:500], "appid": appid if appid != 753 else 0,
+            "game": game if appid and appid != 753 and game != "a game" else "",
+            "image": store_app(appid).get("header", "") if appid and appid != 753 else "",
+            "accountid": who.get("accountid", ""), "steamid": who.get("steamid", ""), "avatar": who.get("avatar", "")}
+
+
+def describe_presence(e):
+    """A logged friend change (cache.log_presence) as the Events tab shows it."""
+    name, game = e.get("name") or "A friend", e.get("game") or app_name(e.get("appid")) or "a game"
+    text = {"online": "%s came online" % name, "offline": "%s went offline" % name,
+            "playing": "%s started playing %s" % (name, game), "stopped": "%s stopped playing %s" % (name, game)}
+    return dict(e, text=text.get(e.get("kind"), name), detail="")
+
+
+def events():
+    """The event log, newest first: Steam's notifications (saved as they're
+    seen, so they outlast Steam's own short list) and friends' comings and
+    goings. When Steam can't be reached, the log so far and why."""
+    error = ""
+    try:
+        seen = evaluate(EVENTS_JS)
+        cache.add_events([dict(n, id="n:" + str(n.get("id")), source="steam")
+                          for n in seen if isinstance(n, dict)] if isinstance(seen, list) else [])
+    except (OSError, urllib.error.URLError):
+        error = "Can't reach Steam. Is it running?"
+    except RuntimeError as e:
+        error = str(e)[:300]
+    out = []
+    for e in cache.load_events():
+        try:
+            out.append(describe_notification(e) if e.get("source") == "steam" else describe_presence(e))
+        except (TypeError, ValueError, AttributeError):
+            pass
+    return {"events": out, "error": error}
+
+
+def digits(value, what):
+    """An id from argv (only digits, so it's safe inside a JS string)."""
+    if not re.fullmatch(r"\d{1,20}", value):
+        raise ValueError("not a %s: %s" % (what, value))
+    return value
+
+
+def chat_target(target):
+    """JS for a chat: a friend's (account id) or a group chat room (groupid:roomid)."""
+    m = re.fullmatch(r"(\d{1,20}):(\d{1,20})", target)
+    if m:
+        return 'g_FriendsUIApp.ChatStore.GetChatRoomGroup("%s").GetChatRoom("%s")' % m.groups()
+    if re.fullmatch(r"\d{1,10}", target):
+        return "g_FriendsUIApp.ChatStore.GetFriendChat(%d, true)" % int(target)
+    raise ValueError("not a chat: %s" % target)
 
 
 def main(argv):
@@ -423,12 +985,50 @@ def main(argv):
         # What Steam's own "Uninstall" confirmation calls once you confirm.
         return evaluate('SteamClient.Installs.OpenUninstallWizard([%d], true); "uninstalling"' % int(argv[2]))
     if cmd == "friends":
-        return evaluate(FRIENDS_JS)
+        value = evaluate(FRIENDS_JS % {"persona": PERSONA_JS, "invite": INVITE_OPTIONS_JS})
+        if isinstance(value, dict):
+            cache.save_friends(value.get("friends") or [], value.get("groups") or [])
+            cache.log_presence(value.get("friends") or [])
+        return value
     if cmd == "chat":
         read = "true" if len(argv) > 3 and argv[3] == "read" else "false"
-        return evaluate(CHAT_JS % {"account": int(argv[2]), "read": read, "html": HTML_JS})
+        value = evaluate(CHAT_JS % {"target": chat_target(argv[2]), "read": read, "html": HTML_JS, "embeds": EMBEDS_JS, "persona": PERSONA_JS})
+        for m in value.get("messages", []) if isinstance(value, dict) else []:
+            for card in m.get("cards") or []:
+                if card.get("type") == "store":
+                    card.update(store_app(card.get("appid")))
+                elif card.get("type") == "youtube":
+                    card.update(youtube_info(card.get("id")))
+        return value
+    if cmd == "react":
+        # react <account> <timestamp> <ordinal> <type> <reaction> <add|remove>
+        reaction = argv[6]
+        if not re.fullmatch(r":?[\w-]{1,64}:?", reaction):
+            raise ValueError("not a reaction: %s" % reaction)
+        return evaluate(REACT_JS % {"target": chat_target(argv[2]), "ts": int(argv[3]), "ordinal": int(argv[4]),
+                                    "type": int(argv[5]), "reaction": json.dumps(reaction),
+                                    "add": "true" if argv[7] == "add" else "false"})
+    if cmd == "emoticons":
+        return evaluate(EMOTICONS_JS)
     if cmd == "send":
-        return evaluate(SEND_JS % {"account": int(argv[2]), "text": json.dumps(sys.stdin.read())})
+        return evaluate(SEND_JS % {"target": chat_target(argv[2]), "text": json.dumps(sys.stdin.read())})
+    if cmd == "invite":
+        # invite <account>: to the game you're in, as Steam's friend menu does.
+        return evaluate(INVITE_JS % {"account": int(digits(argv[2], "friend")), "invite": INVITE_OPTIONS_JS})
+    if cmd == "events":
+        return events()
+    if cmd == "groups":
+        return evaluate(GROUPS_JS)
+    if cmd == "members":
+        return evaluate(MEMBERS_JS % {"group": digits(argv[2], "group"), "persona": PERSONA_JS})
+    if cmd == "remote":
+        return evaluate(REMOTE_JS)
+    if cmd == "stream":
+        # What Steam's Stream button does.
+        return evaluate('SteamClient.Apps.StreamGame(%d, "%s", -1); "streaming"' % (int(argv[2]), digits(argv[3], "computer")))
+    if cmd == "desktop":
+        # Remote Play another computer's whole desktop, as Steam's device list does.
+        return evaluate('SteamClient.RemotePlay.StartDesktopStream("%s"); "streaming"' % digits(argv[2], "computer"))
     if cmd == "wizard-state":
         return evaluate("SteamClient.Installs.GetInstallManagerInfo().then(i => i.eInstallState)")
     if cmd == "overview":
@@ -443,6 +1043,10 @@ def main(argv):
 
 
 if __name__ == "__main__":
+    import demo
+    if demo.ACTIVE:
+        demo.ensure_built()
+        demo.patch(sys.modules[__name__], "steamctl")
     try:
         out = json.dumps({"ok": True, "value": main(sys.argv)})
         if len(out) > MAX_OUTPUT:

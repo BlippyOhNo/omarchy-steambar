@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 """Steam data for the blip.steam bar widget, read from the local Steam client.
 
-  steam.py games    -> {"user": {...}, "games": [...]}   (recent + library)
+  steam.py games    -> {"games": [...]}   (recent + library)
   steam.py friends  -> {"friends": [...]}                 (live online status)
+  steam.py friends-cached -> {"friends", "groups", "saved", "collapsed"}  (the last list seen, instantly)
+  steam.py set-collapsed '["3", "offline"]'  -> remember which friend groups are minimised
+  steam.py clear-cache    -> empty ~/.cache/blip-steam (keeps minimised groups)
   steam.py downloads -> {"downloads": [...]}              (active/paused downloads)
   steam.py storelists -> {"top": ..., "upcoming": ..., "new": ...}  (the store's lists, 50 each)
   steam.py store APPID -> {...}                           (a game's store page)
@@ -25,6 +28,7 @@ import threading
 import time
 import urllib.request
 
+import cache
 
 
 def find_steam():
@@ -42,8 +46,28 @@ def find_steam():
 
 
 STEAM = find_steam()
-CACHE = os.path.expanduser("~/.cache/blip-steam")
+CACHE = cache.CACHE
 STEAMID64_BASE = 76561197960265728
+
+
+# ---------- cached files ----------
+def read_json(path, max_age=None):
+    """A JSON file's contents, or None if it's missing, unreadable or older than max_age seconds."""
+    try:
+        if max_age is not None and time.time() - os.path.getmtime(path) > max_age:
+            return None
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def write_json(path, data):
+    """Write atomically (to a temporary file, then rename)."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path + ".tmp", "w") as f:
+        json.dump(data, f)
+    os.replace(path + ".tmp", path)
 
 
 # ---------- network ----------
@@ -140,7 +164,20 @@ def ci(d, key):
 
 # ---------- binary appinfo.vdf ----------
 def read_appinfo():
+    """{appid: {name, type}} from appinfo.vdf. Parsing it takes ~0.5 s, so the
+    result is kept until Steam rewrites the file (its size or time changes)."""
     path = os.path.join(STEAM, "appcache", "appinfo.vdf")
+    st = os.stat(path)
+    stamp = "%d:%d" % (st.st_mtime_ns, st.st_size)
+    saved = read_json(os.path.join(CACHE, "appinfo.json"))
+    if isinstance(saved, dict) and saved.get("stamp") == stamp and isinstance(saved.get("apps"), dict):
+        return {int(k): v for k, v in saved["apps"].items()}
+    apps = parse_appinfo(path)
+    write_json(os.path.join(CACHE, "appinfo.json"), {"stamp": stamp, "apps": apps})
+    return apps
+
+
+def parse_appinfo(path):
     with open(path, "rb") as f:
         d = f.read()
     magic, _ = struct.unpack_from("<II", d, 0)
@@ -232,10 +269,10 @@ def localconfig(user):
 
 # ---------- images ----------
 def art_for(appid):
-    """Header (wide capsule) and icon images, local from Steam's library cache
-    when it has them, else the store CDN."""
+    """Header (wide capsule), icon and portrait cover (600x900) images, local
+    from Steam's library cache when it has them, else the store CDN."""
     base = os.path.join(STEAM, "appcache", "librarycache", str(appid))
-    header = icon = ""
+    header = icon = portrait = ""
     try:
         for entry in os.scandir(base):
             if entry.is_dir():
@@ -243,25 +280,25 @@ def art_for(appid):
                     h = os.path.join(entry.path, name)
                     if not header and os.path.exists(h):
                         header = h
+                p = os.path.join(entry.path, "library_600x900.jpg")
+                if not portrait and os.path.exists(p):
+                    portrait = p
             elif entry.name == "header.jpg":
                 header = entry.path
+            elif entry.name == "library_600x900.jpg":
+                portrait = entry.path
             elif re.fullmatch(r"[0-9a-f]{40}\.jpg", entry.name):
                 icon = entry.path  # top-level <sha1>.jpg is the small app icon
     except OSError:
         pass
-    if not header:
-        header = "https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/%d/header.jpg" % appid
-    return header, icon
+    cdn = "https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/%d/" % appid
+    return header or cdn + "header.jpg", icon, portrait or cdn + "library_600x900.jpg"
 
 
 # ---------- games ----------
 def installed_apps():
     out = set()
-    folders = ci(read_vdf(os.path.join(STEAM, "steamapps", "libraryfolders.vdf")), "libraryfolders")
-    paths = [STEAM] + [ci(v, "path") for v in folders.values() if isinstance(v, dict)]
-    for p in paths:
-        if not isinstance(p, str) or not p:
-            continue
+    for p in library_paths():
         try:
             for name in os.listdir(os.path.join(p, "steamapps")):
                 m = re.match(r"appmanifest_(\d+)\.acf$", name)
@@ -297,7 +334,7 @@ def games():
         if not meta or meta["type"] != "game" or not meta["name"]:
             continue
         lp, pt = played.get(aid, (0, 0))
-        header, icon = art_for(aid)
+        header, icon, portrait = art_for(aid)
         out.append({
             "appid": aid,
             "name": meta["name"],
@@ -306,9 +343,10 @@ def games():
             "installed": aid in installed,
             "header": header,
             "icon": icon,
+            "portrait": portrait,
         })
     out.sort(key=lambda g: (-g["lastPlayed"], g["name"].lower()))
-    return {"user": user, "games": out}
+    return {"games": out}
 
 
 # ---------- friends ----------
@@ -321,6 +359,8 @@ def fetch_status(accountid):
     name = re.search(r'class="persona[^"]*">([^<]*)<', page)
     status = re.search(r'class="friend_status_[\w-]+">([^<]*)<', page)
     game = re.search(r'class="miniprofile_game_name">([^<]*)<', page)
+    logo = re.search(r'class="game_logo" src="(https://[^"]+)"', page)
+    logo_app = re.search(r"/apps/(\d+)/", logo.group(1)) if logo else None
     state = state.group(1)[:32] if state else "offline"
     status_text = html.unescape(status.group(1)).strip() if status else ""
     if state == "online" and re.search(r"away|snooze", status_text, re.I):
@@ -330,6 +370,8 @@ def fetch_status(accountid):
         "name": clip(html.unescape(name.group(1)).strip(), MAX_NAME) if name else "",
         "statusText": clip(status_text, MAX_NAME),
         "game": clip(html.unescape(game.group(1)).strip(), MAX_NAME) if game else "",
+        "gameIcon": clip(html.unescape(logo.group(1)), MAX_URL) if logo else "",
+        "appid": int(logo_app.group(1)) if logo_app else 0,
     }
 
 
@@ -367,6 +409,7 @@ def friends_from_api(key, user):
                 "state": state,
                 "statusText": {"in-game": "In-Game", "offline": "Offline", "away": "Away", "busy": "Busy"}.get(state, "Online"),
                 "game": clip(p.get("gameextrainfo"), MAX_NAME),
+                "appid": int(p["gameid"]) if str(p.get("gameid", "")).isdigit() and int(p["gameid"]) < 2 ** 32 else 0,
                 "lastOnline": p.get("lastlogoff", 0) if isinstance(p.get("lastlogoff"), int) else 0,
             })
     return people
@@ -377,10 +420,22 @@ def friends_from_community(user):
     from each public mini-profile. Steam answers bursts with HTTP 500, so the
     fetches are spaced out and stop at the first refusal; statuses that
     weren't refreshed this round keep their last known value."""
-    cfg = ci(ci(localconfig(user), "UserLocalConfigStore"), "friends")
+    store = ci(localconfig(user), "UserLocalConfigStore")
+    cfg = ci(store, "friends")
+    # The client keeps the nicknames you've given people here (not for
+    # everyone, only those it has cached).
+    nicknames = {}
+    try:
+        cached = json.loads(ci(ci(store, "WebStorage"), "friendstore_playercache") or "[]")
+    except (TypeError, ValueError):
+        cached = []
+    for c in seq(cached, MAX_FRIENDS):
+        if isinstance(c, dict) and str(c.get("steamid", "")).isdigit() and c.get("nickname"):
+            nicknames[str(int(c["steamid"]) - STEAMID64_BASE)] = clip(c["nickname"], MAX_NAME)
     people = []
     for k, v in cfg.items() if isinstance(cfg, dict) else []:
-        if k.isdigit() and isinstance(v, dict) and k != user["accountid"]:
+        # Steam groups (clans) share this block; their ids don't fit in 32 bits.
+        if k.isdigit() and int(k) < 2 ** 32 and isinstance(v, dict) and k != user["accountid"]:
             avatar = ci(v, "avatar")
             if len(people) >= MAX_FRIENDS:
                 break
@@ -392,13 +447,14 @@ def friends_from_community(user):
                           if isinstance(avatar, str) and avatar else "",
             })
 
-    os.makedirs(CACHE, exist_ok=True)
-    cache_path = os.path.join(CACHE, "friends.json")
-    try:
-        with open(cache_path) as f:
-            known = json.load(f)
-    except (OSError, ValueError):
-        known = {}
+    known = cache.load_statuses()
+    if not known:
+        # Statuses saved before the cache moved into SQLite.
+        try:
+            with open(os.path.join(CACHE, "friends.json")) as f:
+                known = obj(json.load(f))
+        except (OSError, ValueError):
+            known = {}
 
     # Oldest-checked first, so a round cut short still makes progress.
     order = sorted(people, key=lambda p: known.get(p["accountid"], {}).get("checked", 0))
@@ -417,13 +473,15 @@ def friends_from_community(user):
         p["state"] = s.get("state", "unknown")
         p["statusText"] = s.get("statusText", "")
         p["game"] = s.get("game", "")
+        p["gameIcon"] = s.get("gameIcon", "")
+        p["appid"] = s.get("appid", 0)
         if s.get("name"):
             p["name"] = s["name"]
+        if nicknames.get(p["accountid"]):
+            p["personaName"] = p["name"] if p["name"] != nicknames[p["accountid"]] else ""
+            p["name"] = nicknames[p["accountid"]]
 
-    tmp = cache_path + ".tmp"
-    with open(tmp, "w") as f:
-        json.dump(known, f)
-    os.replace(tmp, cache_path)
+    cache.save_statuses(known)
     return people
 
 
@@ -441,12 +499,25 @@ def friends():
             error = "Steam Web API: %s" % e
     if people is None:
         people = friends_from_community(user)
-    rank = {"in-game": 0, "online": 1, "busy": 2, "away": 2}
-    people.sort(key=lambda p: (rank.get(p["state"], 3), p["name"].lower()))
-    out = {"friends": people, "source": "api" if key and not error else "community"}
+    out = {"friends": people, "groups": []}
     if error:
         out["error"] = error
+    cache.save_friends(people, [])
     return out
+
+
+def clear_cache():
+    """Empty the cache: the SQLite data, the store's saved lists and pages,
+    and their converted art."""
+    cache.clear()
+    removed = 0
+    for folder in (CACHE, os.path.join(CACHE, "store"), os.path.join(CACHE, "store", "img")):
+        for name in os.listdir(folder) if os.path.isdir(folder) else []:
+            path = os.path.join(folder, name)
+            if os.path.isfile(path) and name.endswith((".json", ".webp", ".png", ".jpg")):
+                os.remove(path)
+                removed += 1
+    return {"cleared": removed}
 
 
 # ---------- downloads ----------
@@ -507,6 +578,22 @@ def steam_reachable():
         return True
     except Exception:
         return False
+
+
+DEBUG_FLAG = os.path.join(STEAM, ".cef-enable-remote-debugging")
+
+
+def steam_running():
+    """Whether the Steam client is running (native or Flatpak)."""
+    for pid in os.listdir("/proc"):
+        if pid.isdigit():
+            try:
+                with open("/proc/%s/comm" % pid) as f:
+                    if f.read().strip() in ("steam", "steamwebhelper"):
+                        return True
+            except OSError:
+                pass
+    return False
 
 
 def steam_overview():
@@ -582,7 +669,7 @@ def downloads():
             if info is None:
                 info = read_appinfo()
             meta = info.get(aid, {})
-            header, icon = art_for(aid)
+            header, icon, _ = art_for(aid)
             out.append({
                 "appid": aid,
                 "name": ci(manifest, "name") or meta.get("name") or str(aid),
@@ -609,7 +696,13 @@ def downloads():
     order = {"downloading": 0, "installing": 0, "verifying": 0, "preparing": 0, "queued": 1, "paused": 2}
     out.sort(key=lambda d: (order.get(d["status"], 3), d["name"].lower()))
     out = fold_tools(out, order)
-    return {"downloads": out, "time": time.time(), "controllable": steam_reachable()}
+    controllable = steam_reachable()
+    result = {"downloads": out, "time": time.time(), "controllable": controllable}
+    if not controllable:
+        # Why not, for the popup's notice: Steam closed, the flag file
+        # missing, or Steam started before the flag was made.
+        result.update({"steamRunning": steam_running(), "debugFlag": os.path.exists(DEBUG_FLAG), "debugFlagPath": DEBUG_FLAG})
+    return result
 
 
 # ---------- store lists ----------
@@ -629,13 +722,8 @@ def store_list(kind):
     DLC are skipped. Both endpoints are public. Cached for an hour, and the
     last good copy is used when Steam can't be reached."""
     query = STORE_LISTS[kind]
-    os.makedirs(CACHE, exist_ok=True)
     cache_path = os.path.join(CACHE, "store-%s.json" % kind)
-    try:
-        with open(cache_path) as f:
-            cached = json.load(f)
-    except (OSError, ValueError):
-        cached = None
+    cached = read_json(cache_path)
     if cached and time.time() - cached.get("time", 0) < LIST_MAX_AGE:
         return cached
 
@@ -694,10 +782,7 @@ def store_list(kind):
         if len(out) >= LIST_COUNT:
             break
     result = {"games": out, "time": time.time()}
-    tmp = cache_path + ".tmp"
-    with open(tmp, "w") as f:
-        json.dump(result, f)
-    os.replace(tmp, cache_path)
+    write_json(cache_path, result)
     return result
 
 
@@ -716,17 +801,12 @@ DECK = {1: "Unsupported", 2: "Playable", 3: "Verified"}
 def tag_names():
     """Steam's tag id -> name table, cached for a week."""
     path = os.path.join(CACHE, "tags.json")
-    try:
-        if time.time() - os.path.getmtime(path) < 7 * 86400:
-            with open(path) as f:
-                return {int(k): v for k, v in json.load(f).items()}
-    except (OSError, ValueError):
-        pass
+    saved = read_json(path, 7 * 86400)
+    if isinstance(saved, dict):
+        return {int(k): v for k, v in saved.items()}
     tags = {t["tagid"]: clip(t.get("name"), 64) for t in seq(api_get("IStoreService/GetTagList/v1/", language="english")
             .get("response", {}).get("tags"), 5000) if isinstance(t, dict) and isinstance(t.get("tagid"), int)}
-    with open(path + ".tmp", "w") as f:
-        json.dump(tags, f)
-    os.replace(path + ".tmp", path)
+    write_json(path, tags)
     return tags
 
 
@@ -846,12 +926,9 @@ def store_page(appid):
     folder = os.path.join(CACHE, "store")
     os.makedirs(folder, exist_ok=True)
     path = os.path.join(folder, "%d.json" % appid)
-    try:
-        if time.time() - os.path.getmtime(path) < STORE_MAX_AGE:
-            with open(path) as f:
-                return json.load(f)
-    except (OSError, ValueError):
-        pass
+    saved = read_json(path, STORE_MAX_AGE)
+    if saved is not None:
+        return saved
 
     from concurrent.futures import ThreadPoolExecutor
     request = {
@@ -911,8 +988,7 @@ def store_page(appid):
         m = obj(m)
         src = m.get("hls_h264") or obj(m.get("mp4")).get("max") or obj(m.get("webm")).get("max")
         if isinstance(src, str) and src:
-            movies.append({"type": "video", "src": clip(src, MAX_URL), "thumb": clip(m.get("thumbnail"), MAX_URL),
-                           "name": clip(m.get("name"), MAX_NAME)})
+            movies.append({"type": "video", "src": clip(src, MAX_URL), "thumb": clip(m.get("thumbnail"), MAX_URL)})
     shots = [{"type": "image", "src": clip(s.get("path_full"), MAX_URL), "thumb": clip(s.get("path_thumbnail"), MAX_URL)}
              for s in seq(d.get("screenshots"), MAX_MEDIA) if isinstance(s, dict)]
     reqs = obj(d.get("pc_requirements"))
@@ -920,7 +996,6 @@ def store_page(appid):
     result = {
         "appid": appid,
         "name": clip(d.get("name"), MAX_NAME),
-        "header": clip(d.get("header_image"), MAX_URL),
         "short": plain(clip(d.get("short_description"), MAX_TEXT)),
         "free": bool(d.get("is_free")),
         "price": "Free to Play" if d.get("is_free") else clip(price.get("final_formatted"), 64),
@@ -940,14 +1015,11 @@ def store_page(appid):
             "text": clip(r.get("review"), 700).strip() + ("…" if len(clip(r.get("review"), 701)) > 700 else ""),
             "hours": round(number(obj(r.get("author")).get("playtime_forever")) / 60, 1),
             "helpful": number(r.get("votes_up")),
-            "date": number(r.get("timestamp_created")),
         } for r in seq(top.get("reviews"), 10) if isinstance(r, dict)],
         "tags": [names[t["tagid"]] for t in seq(item.get("tags"), 50) if isinstance(t, dict) and t.get("tagid") in names],
-        "genres": names_of(d.get("genres"), "description", 30),
         "features": list(dict.fromkeys(names_of(d.get("categories"), "description", 60))),
         "platforms": {k: bool(obj(d.get("platforms")).get(k)) for k in ("windows", "mac", "linux")},
         "deck": DECK.get(number(platforms.get("steam_deck_compat_category")), ""),
-        "steamos": DECK.get(number(platforms.get("steam_os_compat_category")), ""),
         "languages": re.sub(r"\s*\*?\s*languages with full audio support$", "", plain(clip(d.get("supported_languages"), MAX_TEXT)))
                      .replace(" *", "*").rstrip("* "),
         "achievements": number(obj(d.get("achievements")).get("total")),
@@ -958,17 +1030,22 @@ def store_page(appid):
         "minimum": styled(clip(reqs.get("minimum"), MAX_TEXT)),
         "recommended": styled(clip(reqs.get("recommended"), MAX_TEXT)),
     }
-    with open(path + ".tmp", "w") as f:
-        json.dump(result, f)
-    os.replace(path + ".tmp", path)
+    write_json(path, result)
     return result
 
 
 if __name__ == "__main__":
+    import demo
+    if demo.ACTIVE:
+        demo.ensure_built()
+        demo.patch(sys.modules[__name__], "steam")
     mode = sys.argv[1] if len(sys.argv) > 1 else "games"
     try:
         result = (store_page(int(sys.argv[2])) if mode == "store"
-                  else friends() if mode == "friends" else downloads() if mode == "downloads"
+                  else friends() if mode == "friends" else cache.load_friends() if mode == "friends-cached"
+                  else cache.save_collapsed(seq(json.loads(sys.argv[2]), 500)) or {} if mode == "set-collapsed"
+                  else clear_cache() if mode == "clear-cache"
+                  else downloads() if mode == "downloads"
                   else store_lists() if mode == "storelists" else games())
     except Exception as e:  # report instead of crashing the widget
         result = {"error": str(e)[:500]}
